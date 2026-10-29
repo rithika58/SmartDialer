@@ -111,9 +111,15 @@ class Simulation:
         provider.on_event(self._on_event)
         self.backup.on_event(self._on_event)
 
+        # patience_seconds is passed through so the controller's hold-queue
+        # budget is computed against the same patience the worker actually
+        # enforces.  Left to its default they disagreed (4s vs 5s), and the
+        # controller was budgeting a shallower queue than the floor really
+        # tolerates.
         self.safety = SafetyController(safety_config or SafetyConfig(
             max_calls_per_second=500.0,
             max_concurrent_calls=20_000,
+            patience_seconds=patience_seconds,
         ), clock=self.clock)
         self.gateway = ProviderGateway(self.providers, self.safety)
         self.allocator = CallAllocator(
@@ -173,7 +179,7 @@ class Simulation:
             "calls": {st.value: calls.get(st, 0) for st in CallState},
             "talk_util": round(m.talk_utilization, 4),
             "occupancy": round(m.occupancy, 4),
-            "window_abandon_rate": round(m.window_abandon_rate, 4),
+            "window_abandon_rate": round(m.window_abandon_rate(now), 4),
             "cum_abandon_rate": round(m.abandon_rate, 4),
             "p_answer": round(self.worker.answer_estimate.p, 4),
             "aggressiveness": round(self.worker.pacer.aggressiveness, 3),

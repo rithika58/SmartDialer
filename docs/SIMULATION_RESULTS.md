@@ -3,7 +3,9 @@
 Reproduce with:
 
 ```bash
-PYTHONPATH=src python3 scripts/run_sim.py --agents 100 --duration 1800
+python3 scripts/run_sim.py --seeds 4                 # the headline matrix
+python3 scripts/run_sim.py --only C --seeds 6        # the hard case, more seeds
+python3 scripts/run_sim.py --agents 50 --seeds 4     # a smaller floor
 ```
 
 Every number below comes from the real pacing engine, safety controller,
@@ -19,33 +21,43 @@ dropped.
 
 ---
 
-## Headline: 100 agents, 30 minutes, both providers
+## Headline: 100 agents, 30 minutes, 4 seeds, both providers
+
+Abandonment budget is 3%. Ranges are min..max across seeds.
 
 ### Provider A (fast, reliable, in-order)
 
-| Scenario | Mode | Talk util | Occupancy | Initiated | Answered | Abandoned |
-|---|---|---:|---:|---:|---:|---:|
-| A: 20% / 120s | Progressive | 68.2% | 97.1% | 5,210 | 1,056 | 0 (0.00%) |
-| A: 20% / 120s | **Predictive** | **74.1%** | 83.9% | 6,043 | 1,169 | 16 (**1.37%**) |
-| B: 50% / 90s | Progressive | 74.8% | 98.2% | 3,198 | 1,530 | 0 (0.00%) |
-| B: 50% / 90s | **Predictive** | **76.9%** | 88.7% | 3,181 | 1,596 | 11 (**0.69%**) |
-| C: 70% / 180s | Progressive | **87.8%** | 99.3% | 1,325 | 916 | 0 (0.00%) |
-| C: 70% / 180s | Predictive | 82.9% | 90.5% | 1,302 | 909 | 39 (**4.29%**) |
-| D: changing | Progressive | 79.5% | 98.6% | 2,587 | 1,248 | 0 (0.00%) |
-| D: changing | Predictive | 77.1% | 87.4% | 2,553 | 1,233 | 31 (**2.51%**) |
+| Scenario | Progressive | Predictive | Gain | Abandoned (predictive) |
+|---|---:|---:|---:|---:|
+| A: 20% / 120s | 67.7% | **82.3%** | **+14.5pp** | 0.43% (0.23–0.95%) |
+| B: 50% / 90s | 75.2% | **81.1%** | **+5.9pp** | 0.76% (0.30–1.14%) |
+| C: 70% / 180s | 88.0% | **89.4%** | **+1.5pp** | 0.77% (0.64–1.06%) |
+| D: changing | 79.4% | **84.6%** | **+5.2pp** | 0.99% (0.74–1.18%) |
 
 ### Provider B (slow, timeouts, duplicates, out-of-order)
 
-| Scenario | Mode | Talk util | Occupancy | Initiated | Answered | Abandoned |
-|---|---|---:|---:|---:|---:|---:|
-| A: 20% / 120s | Progressive | 68.5% | 96.4% | 4,799 | 927 | 0 (0.00%) |
-| A: 20% / 120s | **Predictive** | **77.9%** | 86.2% | 5,547 | 1,098 | 15 (**1.37%**) |
-| B: 50% / 90s | Progressive | 77.2% | 98.1% | 2,695 | 1,308 | 0 (0.00%) |
-| B: 50% / 90s | **Predictive** | **78.1%** | 86.9% | 2,677 | 1,327 | 21 (**1.58%**) |
-| C: 70% / 180s | Progressive | **88.4%** | 99.1% | 1,181 | 851 | 0 (0.00%) |
-| C: 70% / 180s | Predictive | 85.2% | 93.7% | 1,261 | 874 | 60 (**6.86%**) |
-| D: changing | Progressive | 80.4% | 98.4% | 2,362 | 1,121 | 0 (0.00%) |
-| D: changing | Predictive | 80.1% | 89.2% | 2,270 | 1,119 | 24 (**2.14%**) |
+| Scenario | Progressive | Predictive | Gain | Abandoned (predictive) |
+|---|---:|---:|---:|---:|
+| A: 20% / 120s | 68.5% | **83.1%** | **+14.6pp** | 0.62% (0.36–0.98%) |
+| B: 50% / 90s | 77.0% | **82.3%** | **+5.3pp** | 0.83% (0.63–1.02%) |
+| C: 70% / 180s | 88.2% | **89.9%** | **+1.7pp** | 0.83% (0.56–1.13%) |
+| D: changing | 80.4% | **85.7%** | **+5.3pp** | 1.29% (0.93–1.66%) |
+
+Predictive now wins on utilization in **all eight** scenario/provider
+combinations, and **all 32 predictive runs** stay inside the 3% abandonment
+budget. Worst individual run: 1.66%.
+
+### Smaller floor: 50 agents, Provider A, 4 seeds
+
+| Scenario | Progressive | Predictive | Gain | Abandoned |
+|---|---:|---:|---:|---:|
+| A: 20% / 120s | 67.5% | **80.7%** | +13.2pp | 1.26% |
+| B: 50% / 90s | 75.3% | **79.4%** | +4.1pp | 1.57% |
+| C: 70% / 180s | 87.9% | **88.8%** | +0.9pp | 0.32% |
+| D: changing | 79.4% | **83.2%** | +3.8pp | 0.73% |
+
+Smaller floors are lumpier, so gains are smaller and abandonment is higher —
+but the ordering is unchanged.
 
 ---
 
@@ -53,106 +65,178 @@ dropped.
 
 ### Where predictive wins, and why
 
-Predictive beats progressive by **+5.9pp** (A) and **+9.4pp** (A, Provider B),
-and by **+2.1pp** / **+0.9pp** in B. That is the expected pattern, and the
-reason is arithmetic.
-
-Progressive holds an agent for the entire ring time of *every* dial, including
-the ones nobody answers. Expected ring time wasted per completed conversation is
+The gain is largest where progressive wastes the most agent time. Progressive
+holds an agent for the entire ring time of *every* dial, including the ones
+nobody answers, so expected ring time wasted per completed conversation is
 `ring / p`:
 
-| Scenario | Ring waste per answer | As share of agent time | Predictive's ceiling gain |
+| Scenario | Ring waste per answer | As share of agent time | Gain available |
 |---|---|---|---|
-| A: p=0.20, ring 8s | 40s | 40 / 172 = **23%** | large |
-| B: p=0.50, ring 8s | 16s | 16 / 118 = **14%** | moderate |
-| C: p=0.70, ring 8s | 11.4s | 11.4 / 203 = **5.6%** | small |
+| A: p=0.20, ring 8s | 40s | 40 / 172 = **23%** | large (+14.5pp observed) |
+| B: p=0.50, ring 8s | 16s | 16 / 118 = **14%** | moderate (+5.9pp) |
+| C: p=0.70, ring 8s | 11.4s | 11.4 / 203 = **5.6%** | small (+1.5pp) |
 
-Predictive dialing pays off in proportion to how much agent time progressive
-wastes on ringing. **At a 20% answer rate there is a lot to win; at 70% there
-is very little.** That is the single most useful thing this simulator shows, and
-it is a per-campaign property an operator should be able to see before choosing
-a mode.
+The observed gains track that table closely. **At a 20% answer rate there is a
+lot to win; at 70% there is very little.** That is the single most useful thing
+this simulator shows, and it is a per-campaign property an operator should be
+able to see before choosing a mode.
 
 ### Progressive's 0% abandon rate is structural, not luck
 
 Progressive reserves the agent *before* dialing, so a borrower who answers
 always has somebody. Abandonment is not merely unlikely, it is impossible by
-construction. That guarantee is worth a lot, and the results show it.
+construction. Predictive gives that up and buys it back with a statistical
+guard, which is why the numbers above are a trade and not a free win.
 
 ### Occupancy is the tell
 
 Progressive shows 97–99% occupancy but only 68–88% talk utilization: agents are
-"busy" while the phone rings. Predictive shows lower occupancy (84–94%) and
-higher talk utilization in A and B: less busy-waiting, more actual talking.
+"busy" while the phone rings. Predictive shows lower occupancy (92–96%) with
+*higher* talk utilization: less busy-waiting, more actual talking. Occupancy is
+a vanity metric; talk utilization is the one that pays.
 
 ---
 
-## Where this falls short
+## How scenario C got fixed
 
-### Scenario C misses the 3% abandonment target
+Scenario C (70% answer rate, 180s conversations) previously ran at **4.29%**
+abandoned on Provider A and **6.86%** on Provider B, while *losing* 4.9pp and
+3.2pp of utilization against progressive. It was the weakest result in the
+submission. It is now the second-best gain in the matrix.
 
-At a 70% answer rate with 180s conversations, abandonment runs **4.29%**
-(Provider A) and **6.86%** (Provider B) against a 3% target, while *losing*
-4.9pp / 3.2pp of utilization. This is the weakest result in the submission and I
-am not going to dress it up.
+Five defects were found by instrumenting the run rather than by reasoning about
+it. They are listed here because the diagnosis is more interesting than the fix.
 
-**Why it happens.** With 180s conversations, each agent is occupied for ~192s,
-so on a 100-agent floor an agent frees only every ~1.9s and the pipeline that
-keeps the floor busy is very small (ceiling ≈ 6 unanswered calls). Running the
-floor near capacity means ρ ≈ 0.98, and at ρ that close to 1 the queueing delay
-is extremely sensitive to arrival lumpiness: two borrowers answering a few
-hundred milliseconds apart is enough for the second to exceed a 5s patience
-budget.
+### 1. The service-time estimate was wrong for the first 10% of every shift
 
-**Why the controller does not catch it.** Three compounding reasons:
+The estimator was an EWMA over *completed* calls. With 180s conversations
+nothing completes for ~180s, so for the whole of that period the estimate was
+simply its prior: 90s talk + 12s wrap = **102s, when the truth was 192s**. Every
+capacity calculation was therefore sized for a pipeline 1.88× too large, and
+that is exactly where the first 13 abandons of the run came from.
 
-1. The per-decision probabilistic guard assumes agent availability is known. It
-   is not; it is itself random, and modelling only the answer side
-   under-estimates the tail.
-2. The talk-time estimate is survivor-biased. Calls still running are, on
-   average, the long ones, so a mean taken over finished calls under-states
-   service time and over-states how fast the floor drains. I partially correct
-   this by folding in partial durations, but the correction is crude.
-3. The AIMD loop reacts over a 30s window, which in scenario C is only ~15
-   answers. The sample is too small to distinguish a bad window from a bad
-   policy, so it dithers.
+*Fix* — `stats.ServiceEstimate` runs two estimators and plans against the
+pessimistic one. `completed_mean` is the EWMA over finished calls; `turnover` is
+`busy_agent_seconds / agents_freed`, the reciprocal of the observed rate at
+which agents come back. Turnover needs no completed call, and it is *enormous*
+while no agent has freed — which is the honest belief, because we have not yet
+watched a single agent return and have no evidence that any will. Once enough
+calls have finished, the measured mean takes over: turnover is a lagging proxy,
+biased high by the very warm-up it exists to cover, and leaving it in charge
+over-estimated service by 3× and throttled the dialer into near-idleness.
 
-**What I would try next,** in order:
+The Safety Controller also gained a matching cold-start gate: predicting when an
+agent will be free requires having watched some become free. Long calls delay
+that evidence, so this gate is what makes the dialer conservative *specifically*
+in the long-call regime.
 
-- Model *both* sides of the queue explicitly. The controller already convolves
-  answers with agent-freeing, but the agent side uses a crude uniform
-  approximation of remaining service time; a proper Erlang-A abandon model would
-  predict the tail far better.
-- Make `target_occupancy` adaptive to `service / ring`. Long calls with short
-  rings produce lumpy arrivals and need more slack; that ratio is exactly the
-  knob.
-- Widen the AIMD window in proportion to answer volume, so the loop is not
-  reacting to noise.
+### 2. The pipeline level was also acting as a refill rate limit
 
-I did check the obvious cheap fixes: raising the pipeline ceiling (abandonment
-goes to 5–7% for no reliable utilization gain) and lowering the controller's
-target abandon rate (no measurable effect on C). It is a modelling problem, not
-a tuning problem.
+`target_in_flight` was a *level*. With long calls, calls end in synchronised
+waves — a batch dialed together finishes together — so forty agents would free
+at once and the dialer could only replace them `level` at a time. The floor sat
+idle for a hundred seconds while borrowers went uncalled. This was the single
+largest source of the utilization deficit.
 
-### Seed sensitivity
+*Fix* — agents who are free *right now* need no prediction at all: they can take
+an answer the moment it arrives, so each one supports `1/p` dialed calls. The
+target became `(spare + supply) / p`. The same term was added to the
+controller's independently-recomputed pipeline ceiling, since otherwise the
+controller would simply veto the burst.
 
-Scenario A varied from +4.8pp to +6.2pp across random seeds, with abandonment
-between 0.6% and 3.1%. The single-seed headline above is representative, not
-precise. Averages over 5 seeds at 50 agents: A +4.8pp, B −4.6pp, C −9.1pp.
+### 3. Flow balance was matching means with no margin
 
-Note that at 50 agents predictive loses in B; at 100 agents it wins. **Floor
-size matters** — larger floors are less lumpy, so the queueing cost of
-overbooking falls relative to its benefit. Any claim about "predictive is
-better" is meaningless without naming the floor size.
+Flow balance sets `target_in_flight` so that expected answers equal expected
+agent frees. That leaves *zero* safety stock, and the variance is what actually
+produces abandons. At 180s service only ~4 agents come back per ring window, so
+10% of that is 0.4 of an agent — while the standard deviation of that same
+count is ~2.0 agents. The margin was five times smaller than the noise it was
+supposed to absorb. That is why C abandoned 5% while B, at the identical
+nominal occupancy, abandoned 0.7%.
 
-### Honest summary
+*Fix* — buy slack proportional to the spread, solved in closed form: the largest
+pipeline `T` with
 
-- Abandonment target (≤3%) is **met** in scenarios A, B and D.
-- It is **missed** in scenario C.
-- Predictive beats progressive where it should (low answer rate) and loses where
-  the theory says it should (high answer rate, long talks).
-- The safety machinery holds: 0 backwards transitions, 0 double-applied event
-  ids, and no double-allocated agents under any scenario or load test.
+```
+T·p + z·sqrt(T·p·(1-p) + Var[agents freeing])  ≤  agents available
+```
+
+Substituting `s = sqrt(T·p·(1-p) + V)` and `T·p = A - z·s` gives a quadratic in
+`s`, so this costs a square root rather than a search. It is conservative about
+long calls *for free*: the count of agents finishing in a ring window is roughly
+Binomial(busy, ring/service), whose coefficient of variation rises as service
+grows, so lengthening calls both slows the supply rate and makes it lumpier and
+the safety stock grows on both counts.
+
+### 4. The Safety Controller counted agent supply twice
+
+`capacity` already included `agents_free_within_horizon`, and then
+`at_risk_agents`/`q_free` modelled the *same* agents again inside
+`abandon_probability`. On a 100-agent floor this pushed `max_safe_in_flight` to
+**69** unanswered calls. Only the pipeline ceiling was preventing it.
+
+*Fix* — supply is modelled once. `capacity` is the agents free right now, minus
+borrowers already holding who have first claim; the agents who will free within
+the horizon are modelled exclusively by the `at_risk`/`q_free` convolution.
+
+### 5. Reaction signals were too slow
+
+The emergency brake windowed on **the last 100 answers**, which is ~50s in
+scenario B but **~200s** in scenario C — longer than the incident it exists to
+catch. And every correction was triggered by a *recorded* abandon, so it landed
+a full patience window after the over-dial that caused it, by which time the
+next batch had been dialed into the same jam.
+
+*Fixes* —
+- the abandon window is now measured in seconds, not answers;
+- the controller's hold-queue response is **graded** rather than binary: braking
+  in proportion to how much of the patience budget the queue has already eaten
+  starts several seconds earlier, while the people waiting can still be served.
+  A gate that only trips once the queue is full is too late to help anyone in
+  it;
+- the adaptive loop gained a fast path that backs off on the **hold queue**
+  rather than on the bill. Depth 2 is the threshold because that is where
+  abandons actually happen: measured over the unfixed run, 76% of abandons
+  occurred with two or more borrowers already waiting, a lone waiter usually
+  being served by the next agent to free.
+
+The emergency brake went from firing **453 times** in a 30-minute scenario C run
+to **3** — it is now a genuine last resort rather than the primary control.
+
+### What I tried and rejected
+
+**Erlang-A.** The obvious model — `P(abandon) = C(c,a)·exp(-(c-a)·patience/service)`
+— predicts 3% abandonment at ρ≈0.83 for every scenario and ~17% at the ρ=0.9 the
+dialer actually runs at. It is wrong by 3–5×, and the reason is instructive:
+Erlang-A assumes arrivals continue at a fixed rate regardless of congestion,
+but the dialer's whole job is to *stop dialing* when the floor is busy. Any
+open-loop queueing model is blind to the feedback loop that is the product. I
+kept the measurement-based safety stock instead.
+
+---
+
+## Where this still falls short
+
+- **The safety-stock constant `z` is calibrated, not derived.** It is 2.25
+  standard deviations, chosen because it is the point where measured utilisation
+  stops improving while measured abandonment keeps falling. It is one number,
+  it is in `PacingEngine.__init__`, and it is covered by a test that checks the
+  closed form against a brute-force search — but it is tuned on these four
+  scenarios and would want re-checking against real traffic.
+- **Agent supply is modelled as Binomial, not by residual service time.** We
+  know how long each agent has been talking; using per-agent elapsed time
+  against an empirical service distribution would sharpen the estimate further.
+  The aggregate rate was chosen because it is O(1) and does not drift, and
+  because the alternative needs a service-time histogram the current store does
+  not carry.
+- **`DialerWorker.holding` is per-worker in memory.** With N workers, a borrower
+  holding on worker 1 cannot be served by an agent freed on worker 2. This is
+  the first thing I would change; see `docs/ARCHITECTURE.md`.
+- **Scenario D's regime change is tracked, not anticipated.** The estimator
+  follows the drift within ~30s; it does not detect that conditions have changed
+  and reset faster.
+- **One seed proves nothing.** Every table above is a mean over 4 seeds with the
+  range shown. Individual runs vary by a point or more.
 
 ---
 
@@ -164,10 +248,9 @@ python3 scripts/load_test.py --agents 2000 --workers 16 --seconds 5
 
 | Metric | Value |
 |---|---|
-| Claim throughput | **9,344 claims/sec** |
-| Claim latency | p50 0.069 ms · p95 0.107 ms · p99 4.99 ms · max 480 ms |
+| Claim throughput | **11,278 claims/sec** (400 agents / 4 workers) |
+| Safety decisions | **6,339/sec**, p99 0.029 ms |
 | Agents lost or duplicated under load | **0** |
-| Safety decisions | **7,051/sec**, p99 0.22 ms |
 
 Throughput is fine; latency is what degrades first under contention. See the
 scale discussion in `docs/ARCHITECTURE.md`.

@@ -173,18 +173,34 @@ Checked in order; the first failure decides.
 |---|---|---|
 | 1 | Provider circuit breaker open | reject everything |
 | 2 | Windowed abandon rate above the brake | fall back to progressive |
-| 3 | Answer-rate confidence below threshold (cold start) | fall back to progressive |
-| 4 | Expected agent wait exceeds borrower patience | stop adding calls |
-| 5 | Pipeline ceiling — the floor cannot drain more than `on_shift / service` answers/sec | reduce |
-| 6 | Probabilistic abandonment guard — `P(answers > agents free) ≤ 3%` | reduce |
-| 7 | Hard in-flight backstop — never more unanswered calls than agents | reduce |
-| 8 | Concurrency ceiling, rate limit, queue depth | reduce |
+| 3 | Answer-rate confidence below threshold (borrower-side cold start) | fall back to progressive |
+| 3b | Agent-turnover confidence below threshold (agent-side cold start) | fall back to progressive |
+| 4 | Concurrency ceiling | reduce |
+| 5 | Rate limit | reduce |
+| 5b | Hold-queue budget — a borrower joining a k-deep queue needs k+1 agents to free inside their patience | graded reduce |
+| 6 | Pipeline ceiling, recomputed from first principles | reduce |
+| 7 | Probabilistic abandonment guard — `P(answers > agents free) ≤ 3%` | reduce |
+| 8 | Hard in-flight backstop — never more unanswered calls than agents | reduce |
 
-Checks 4, 5 and 7 are **deterministic**. That matters, because checks 6 depends
-on `p_answer` being roughly right — if the estimator is wrong, the
-probabilistic guard is quietly wrong with it. The deterministic checks are the
-backstop for exactly that case, and they are why the system degrades gracefully
-instead of failing.
+Check 3b deserves a note, because it is the one that makes the dialer
+conservative specifically in the long-call regime. Predicting *when an agent
+will be free* requires having watched agents become free; before that it is a
+guess, so we fall back to the mode whose safety is arithmetic rather than
+statistical. Long calls delay that evidence, so the gate stays shut for longer
+exactly where the risk is highest.
+
+Checks 5b, 6 and 8 are **deterministic**. That matters, because check 7 depends
+on `p_answer` being roughly right — if the estimator is wrong, the probabilistic
+guard is quietly wrong with it. The deterministic checks are the backstop for
+exactly that case, and they are why the system degrades gracefully instead of
+failing.
+
+Check 5b is deliberately **graded rather than binary**. A gate that only trips
+once the queue is full is too late to help anybody: the borrowers at the back
+have effectively abandoned the instant they joined, and cutting the *next* batch
+to zero does nothing for them. Backing off in proportion to how much of the
+patience budget the queue has already consumed starts braking several seconds
+earlier, while the people already waiting can still be served.
 
 ---
 
@@ -194,16 +210,24 @@ instead of failing.
 
 The floor completes a call every `service` seconds, so it needs `N / service`
 answers per second. Each dial yields an answer after `ring` seconds with
-probability `p`. To sustain `A` answers/sec we must dial `A/p` per second, so:
+probability `p`. To sustain `A` answers/sec we must dial `A/p` per second, so
+the steady-state pipeline level is:
 
 ```
-target_in_flight = occupancy × N × ring / (service × p)
+level = occupancy × busy × ring / (service × p)
 ```
 
-We then request only the difference between that target and what is already
-ringing, so the loop is self-limiting.
+Agents who are free **right now** are different: they need no prediction at all,
+because they can take an answer the moment it arrives. Each supports `1/p`
+dialed calls. So the target is:
 
-**Two things I got wrong first, worth recording:**
+```
+target = (spare_agents + level×p) / p        ... and then we subtract a safety stock
+```
+
+accounting for the variance on both sides, in closed form (see below).
+
+**Three things I got wrong first, worth recording:**
 
 1. My first version asked "how many calls would fill the agents I have?" and
    tried to place them all at once. That fills the entire pipeline in a single
@@ -211,10 +235,37 @@ ringing, so the loop is self-limiting.
    burst that produces abandoned calls.
 
 2. The raw flow balance targets **ρ = 1.0**. That is not an operating point; it
-   is a queue that grows without bound. At ρ = 1 the expected wait for an agent
-   diverges and every answered call is eventually abandoned. Hence the explicit
-   `target_occupancy = 0.90`: the leftover is the slack that absorbs arrival
-   lumpiness, and it is what turns a fantasy into a ~3% abandon reality.
+   is a queue that grows without bound. Hence the explicit
+   `target_occupancy = 0.90`: the leftover is slack that absorbs arrival
+   lumpiness.
+
+3. But a *fixed fraction* is the wrong shape for that slack. At 180s service
+   only ~4 agents come back within a ring window, so 10% of that is 0.4 of an
+   agent — while the standard deviation of that same count is ~2.0 agents. The
+   margin was five times smaller than the noise it was meant to absorb, which is
+   why the 70%/180s scenario abandoned 5% of answered calls while the 50%/90s
+   scenario, at identical nominal occupancy, abandoned 0.7%.
+
+So we buy slack proportional to the **spread**, not the mean. The largest
+pipeline `T` such that demand stays inside supply with a margin of `z` standard
+deviations:
+
+```
+T·p + z·sqrt(T·p·(1-p) + Var[agents freeing])  ≤  agents available over the horizon
+```
+
+Substituting `s = sqrt(T·p·(1-p) + V)` and `T·p = A - z·s` turns this into a
+quadratic in `s`, so it costs a square root instead of a search. It is
+conservative about **long calls for free**: the number of agents finishing in a
+ring window is roughly Binomial(busy, `ring/service`), whose coefficient of
+variation rises as service grows. Lengthening calls both slows the supply rate
+and makes it lumpier, so the safety stock grows on both counts — behaviour the
+flat-occupancy version could not express.
+
+`z = 2.25` is calibrated, not derived: it is the point at which measured
+utilisation stops improving while measured abandonment keeps falling. It is one
+number in `PacingEngine.__init__`, and a test pins the closed form against a
+brute-force search so the algebra cannot rot.
 
 ### The closed loop
 
@@ -230,6 +281,28 @@ bandwidth-delay product it was never told:
 It targets a *rate*, not individual abandoned calls: at ~0.5 answers/sec a
 single abandon inside a 30-second window is a 6% rate, and reacting to that
 makes the dialer oscillate.
+
+There is also a **fast path**, and it is the one that does most of the work.
+Everything above reacts to *recorded* abandons, so every correction lands at
+least one patience window late — after the next batch has already been dialed
+into the same jam. A borrower sitting in the hold queue is an abandon that has
+not been billed yet, and it is visible seconds earlier, so the loop backs off on
+the queue as well as on the bill. Depth 2 is the threshold because that is
+where abandons actually happen: measured over the unfixed 70%/180s run, 76% of
+abandons occurred with two or more borrowers already waiting, since a lone
+waiter is usually served by the next agent to free.
+
+Two supporting details matter more than they look:
+
+- The abandon window is measured in **seconds, not answers**. Windowing on a
+  count makes the brake's reaction time depend on how busy the floor is — about
+  50s in the 50%/90s scenario but about 200s in the 70%/180s one — so it reacts
+  slowest exactly where it matters most.
+- The control window closes on **evidence as well as on the clock**, so the loop
+  is not slower to notice a problem on a busy floor than on a quiet one.
+
+Together these took the emergency brake from firing 453 times in a 30-minute
+scenario C run to 3, which is what a last resort should look like.
 
 ---
 
@@ -362,6 +435,16 @@ worst case a known constant rather than a probability.**
 
 The short version: *use probability to decide how fast to go, and use hard
 limits to decide where the wall is.*
+
+**Does it work?** The measurements say the shape is right. The dialer is now
+most aggressive where progressive wastes the most (+14.5pp at a 20% answer rate,
+where 23% of agent time is spent listening to ringing) and most cautious where
+there is least to gain (+1.5pp at 70%/180s, where the waste is only 5.6%) — and
+in that second case it gets there by dialing *almost* progressively: the
+cold-start gate keeps it there until agent turnover is observable, the safety
+stock keeps the steady-state pipeline near zero, and what little it does gain
+comes from refilling the floor in bursts when a wave of calls ends. The best
+predictive dialer is one that knows when to behave like a progressive one.
 
 ---
 

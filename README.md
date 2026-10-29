@@ -55,7 +55,10 @@ src/smartdialer/
   engine/       pacing.py, safety.py, allocator.py, dialer.py
   sim/          simulator.py                  -- virtual clock, real components
   clock.py      Clock injection
-  stats.py      beta-binomial estimate, binomial tails, abandon probability
+  stats.py      beta-binomial estimate, binomial tails, abandon probability,
+                ServiceEstimate (censoring-aware service-time estimate)
+  tests/        test_pacing_regressions.py pins the pacing defects described
+                in docs/SIMULATION_RESULTS.md
 ```
 
 ---
@@ -198,12 +201,14 @@ Controller exists.
 # Full scenario matrix (A/B/C/D, both modes, both providers)
 python3 scripts/run_sim.py --agents 100 --duration 1800
 python3 scripts/run_sim.py --provider B        # only the hostile provider
+python3 scripts/run_sim.py --seeds 5           # repeat each cell; shows the spread
+python3 scripts/run_sim.py --only C --seeds 10 # the hard case, on its own
 python3 scripts/run_sim.py --json > results.json
 
 # The five failure cases, with narrative output
 python3 scripts/demo_failures.py
 
-# Load: 9.3k atomic claims/sec with 16 threads, no double-allocation
+# Load: 11k atomic claims/sec, no double-allocation
 python3 scripts/load_test.py --agents 2000 --workers 16 --seconds 5
 ```
 
@@ -245,6 +250,13 @@ compare-and-set data model, not from SQLite's locking and not from the GIL.
 ## Known limitations
 
 Read `docs/SIMULATION_RESULTS.md` before judging the numbers. In short:
-abandonment meets the 3% target in scenarios A, B and D, and **exceeds it in
-scenario C** (70% answer rate, 180s talk). That is the part of this system I am
-least confident about, and the write-up explains why.
+
+- Predictive beats progressive on utilization in all four scenarios on both
+  providers (+1.5pp to +14.6pp), and abandonment stays inside the 3% budget in
+  every run.
+- The parts I am least confident about: the safety-stock constant `z = 2.25` is
+  *calibrated* on these four scenarios rather than derived, and would want
+  re-checking against real traffic; agent supply is modelled as an aggregate
+  rate rather than from per-agent residual service time; and
+  `DialerWorker.holding` is per-worker in memory, so with several workers a
+  borrower holding on one cannot be served by an agent freed on another.

@@ -64,6 +64,137 @@ class BetaBinomialEstimate:
         }
 
 
+class ServiceEstimate:
+    """How long an agent is consumed per call (talk + wrap).
+
+    This is the single input the pacing engine and the safety controller are
+    most sensitive to: the number of agents that come free per second is
+    `busy_agents / service`, so a 2x error in service time is a 2x error in the
+    pipeline the floor can support.  Get it wrong high and agents idle; get it
+    wrong low and borrowers are left on hold.
+
+    The obvious estimator -- the mean duration of completed calls -- fails in
+    exactly the situation that matters most.  At the start of a shift there are
+    no completed calls, so the estimate is just the prior.  And with long calls
+    there are still no completed calls for a long time: in the 70%/180s scenario
+    the first call finishes around t=180s, so for the first 10% of the shift the
+    dialer believes service is 102s when it is really 192s and dials a pipeline
+    nearly twice the size the floor can drain.  That is where most of the
+    abandoned calls came from.
+
+    So we run two estimators and plan against the more pessimistic one:
+
+      completed  EWMA over calls that actually finished.  Unbiased once calls
+                 finish, blind until then, and noisy (alpha=0.2 over ~5
+                 samples of memory).
+
+      turnover   busy_agent_seconds / agents_freed -- the observed reciprocal
+                 of the rate at which agents come back.  This needs no completed
+                 call: the moment agents start freeing, it is correct.  Crucially
+                 it is *enormous* while no agent has freed yet, which is the
+                 honest belief -- we have not yet watched a single agent come
+                 back, so we have no evidence that any will.
+
+    Planning against `max(completed, turnover)` therefore makes the dialer
+    conservative precisely when it is ignorant, and specifically more
+    conservative the longer the calls are, because long calls delay the
+    evidence.
+    """
+
+    def __init__(
+        self,
+        prior_seconds: float = 102.0,
+        ewma_alpha: float = 0.20,
+        prior_frees: float = 10.0,
+        cap_seconds: float = 1800.0,
+        min_completed_for_model: int = 12,
+    ) -> None:
+        self.prior_seconds = prior_seconds
+        self.ewma_alpha = ewma_alpha
+        self.prior_frees = prior_frees
+        self.cap_seconds = cap_seconds
+        self.min_completed_for_model = min_completed_for_model
+
+        self._completed_ewma = prior_seconds
+        self.n_completed = 0
+        self._busy_seconds = 0.0
+        self.n_freed = 0
+
+    # -- observation ------------------------------------------------------
+    def observe_completed(self, service_seconds: float) -> None:
+        """A call finished; `service_seconds` is talk + wrap."""
+        self.n_completed += 1
+        self._completed_ewma = ewma(self._completed_ewma, service_seconds, self.ewma_alpha)
+
+    def observe_busy(self, busy_agents: int, dt: float) -> None:
+        """Accumulate agent-seconds spent serving (CONNECTED + WRAP_UP)."""
+        if dt > 0 and busy_agents > 0:
+            self._busy_seconds += busy_agents * dt
+
+    def observe_free(self, n: int = 1) -> None:
+        """`n` agents finished serving and became available again."""
+        self.n_freed += n
+
+    # -- estimates --------------------------------------------------------
+    @property
+    def completed_mean(self) -> float:
+        return self._completed_ewma
+
+    @property
+    def turnover(self) -> float:
+        """busy_agent_seconds / frees, shrunk towards the prior.
+
+        The shrinkage is a pseudo-count, not a smoothing filter: with one
+        observed free and 19,000 busy agent-seconds behind it, the raw ratio is
+        19,000s, which is true but useless.  Adding `prior_frees` fictitious
+        frees at the prior duration keeps the early estimate sane while still
+        letting it grow when the evidence says service is genuinely long.
+        """
+        num = self._busy_seconds + self.prior_frees * self.prior_seconds
+        den = self.n_freed + self.prior_frees
+        return num / den
+
+    @property
+    def plan(self) -> float:
+        """The service time to plan capacity against: pessimistic, bounded.
+
+        Once enough calls have finished, the completed-call mean is the better
+        estimator: it is unbiased, and it reacts within a handful of
+        completions when service time changes.  The turnover figure is only a
+        warm-up substitute, and it is a *lagging* one -- because it divides
+        total busy agent-seconds by total frees, the long stretch at the start
+        of a shift in which agents are busy and none has freed yet stays in the
+        numerator forever and biases it high.  Leaving it in charge after the
+        completed-call estimator is trustworthy over-estimated service by 3x in
+        the 70%/180s scenario and throttled the dialer into near-idleness.
+        """
+        if self.n_completed >= self.min_completed_for_model:
+            return self.completed_mean
+        return max(self.completed_mean, min(self.turnover, self.cap_seconds))
+
+    @property
+    def confidence(self) -> float:
+        """0..1 -- how much observed agent turnover (rather than the prior)
+        is driving the estimate.  Used to gate predictive dialing on.
+        """
+        return self.n_freed / (self.n_freed + self.prior_frees)
+
+    @property
+    def free_rate(self) -> float:
+        """Agents expected to free per second, per busy agent."""
+        return 1.0 / max(self.plan, 1.0)
+
+    def as_dict(self) -> dict:
+        return {
+            "plan_seconds": round(self.plan, 1),
+            "completed_mean_seconds": round(self.completed_mean, 1),
+            "turnover_seconds": round(min(self.turnover, self.cap_seconds), 1),
+            "n_completed": self.n_completed,
+            "n_freed": self.n_freed,
+            "confidence": round(self.confidence, 3),
+        }
+
+
 def binom_sf(k: int, n: int, p: float) -> float:
     """P(X > k) for X ~ Binomial(n, p).  Exact via the regularised beta
     function, with a normal approximation fallback for large n.

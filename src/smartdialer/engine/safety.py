@@ -34,12 +34,20 @@ Checked in order; the first failure decides the outcome.
   1. Circuit breaker.  Provider unhealthy -> reject everything.
   2. Observed abandonment.  We broke our own promise recently -> fall back to
      deterministic progressive dialing.
-  3. Cold start.  Not enough data to trust the estimate -> progressive.
+  3. Cold start (borrower side).  Not enough observed answer outcomes to trust
+     the answer-rate estimate -> progressive.
+  3b. Cold start (agent side).  Not enough observed agent turnover to predict
+     when an agent will next be free -> progressive.  This is the check that
+     makes long calls conservative: long calls delay the evidence.
   4. Absolute concurrency ceiling.
   5. Rate limit (calls per second).
-  6. Probabilistic abandonment guard: largest N such that
+  5b. Hold-queue budget.  A borrower joining a k-deep queue needs k+1 agents to
+     free before their patience expires; stop adding past that.
+  6. Pipeline ceiling, recomputed independently of the pacing engine.  Allows
+     the steady-state level plus however many agents are free right now.
+  7. Probabilistic abandonment guard: largest N such that
      P(borrowers who answer > agents who will be free) <= max_abandon_prob.
-  7. Overbooking ratio ceiling: a hard, non-statistic backstop so that even a
+  8. Overbooking ratio ceiling: a hard, non-statistic backstop so that even a
      wildly wrong p_answer cannot produce an unbounded batch.
 """
 
@@ -75,6 +83,11 @@ class SafetyConfig:
     max_concurrent_calls: int = 5_000
     max_calls_per_second: float = 50.0
     min_confidence_for_predictive: float = 0.50
+    # Predictive dialing is a bet on when agents come back.  Before we have
+    # watched any come back, it is not a bet, it is a guess -- so we require
+    # some observed agent turnover before dialing ahead of availability.  Long
+    # calls delay that evidence, which is exactly the desired behaviour.
+    min_service_confidence_for_predictive: float = 0.35
     max_observed_abandon_rate: float = 0.08   # emergency brake, not the primary guard
     abandon_sample_min: int = 25            # need this many answers before judging
     patience_seconds: float = 4.0           # how long a borrower waits for an agent
@@ -100,6 +113,11 @@ class SafetyContext:
     # mode after one bad minute.
     observed_abandon_rate: float = 0.0
     abandon_sample_size: int = 0
+    # How much of the service-time estimate comes from observed agent turnover
+    # rather than from the prior.  Low means "we have not yet watched enough
+    # agents come back to predict when the next one will".
+    service_confidence: float = 0.0
+    service_observations: int = 0           # agents observed coming back
     waiting_calls: int = 0                  # answered, still holding for an agent
     on_shift_agents: int = 0
     avg_ring_seconds: float = 8.0
@@ -197,6 +215,27 @@ class SafetyController:
                 checks, ctx,
             )
 
+        # -- 3b. do we know when agents come back? ---------------------------
+        # The check above is about borrower behaviour.  This one is about our
+        # own floor: predicting that an agent will be free requires having
+        # watched agents become free.  Until then, dialing ahead is a guess, so
+        # we fall back to the mode whose safety is arithmetic rather than
+        # statistical.  Long calls delay this evidence, so this is also what
+        # makes the dialer conservative specifically in the long-call regime.
+        if (intent.mode == PacingMode.PREDICTIVE
+                and ctx.service_confidence < cfg.min_service_confidence_for_predictive):
+            self.stats["fallback_progressive"] += 1
+            return self._signed(
+                SafetyAction.FALLBACK_PROGRESSIVE,
+                min(ctx.available_agents, ctx.queued_borrowers),
+                requested, PacingMode.PROGRESSIVE,
+                [f"agent-turnover confidence {ctx.service_confidence:.2f} below "
+                 f"{cfg.min_service_confidence_for_predictive}: only "
+                 f"{ctx.service_observations} agents have come back, so we "
+                 f"cannot yet predict when the next one will"],
+                checks, ctx,
+            )
+
         # -- 4. absolute concurrency ceiling ---------------------------------
         in_flight = ctx.ringing_calls
         headroom = cfg.max_concurrent_calls - in_flight
@@ -233,13 +272,30 @@ class SafetyController:
             checks["expected_wait_seconds"] = round(expected_wait, 2)
             checks["patience_seconds"] = cfg.patience_seconds
             checks["max_queue"] = max_queue
-            if ctx.available_agents == 0 and ctx.waiting_calls + 1 > max_queue:
+            # Only borrowers who cannot be served from the agents already free
+            # are at risk.  A borrower joining the back of a k-deep queue needs
+            # k+1 agents to free before their patience expires, so we stop
+            # adding to the queue once it is as deep as patience allows -- not
+            # once it has already overflowed, which is what the old test did.
+            spare_agents = ctx.available_agents - ctx.waiting_calls
+            checks["spare_agents"] = spare_agents
+            if spare_agents <= 0 and ctx.waiting_calls > 0:
+                # Graded, not binary.  A gate that only trips once the queue is
+                # already full reacts too late to help anyone: the borrowers at
+                # the back have effectively abandoned the instant they joined,
+                # and cutting the *next* batch to zero does nothing for them.
+                # Backing off in proportion to how much of the patience budget
+                # the queue has already eaten starts braking several seconds
+                # earlier, while the people waiting can still be served.
+                pressure = min(1.0, ctx.waiting_calls / max(max_queue, 1))
+                checks["hold_pressure"] = round(pressure, 3)
+                allowed = 0 if pressure >= 1.0 else int(allowed * (1.0 - pressure))
                 reasons.append(
-                    f"hold queue full: {ctx.waiting_calls} already holding, and a "
-                    f"{max_queue}-deep queue is the most a {cfg.patience_seconds:.0f}s "
-                    f"patience can absorb at {inter_free:.1f}s between agents"
+                    f"hold queue pressure {pressure:.0%}: {ctx.waiting_calls} holding, "
+                    f"and a {max_queue}-deep queue is the most a "
+                    f"{cfg.patience_seconds:.0f}s patience can absorb at "
+                    f"{inter_free:.1f}s between agents"
                 )
-                allowed = 0
 
         # -- 6. pipeline ceiling (deterministic, independent of the model) ----
         # This is the check that catches a *systematically* wrong estimate.
@@ -259,13 +315,25 @@ class SafetyController:
             p_ceiling = min(max(ctx.p_answer, 0.02), 0.99)
             ring_c = max(ctx.avg_ring_seconds, 1.0)
             service_c = max(ctx.mean_service_seconds, 1.0)
-            ceiling = (
+            level = (
                 cfg.max_pipeline_occupancy
                 * max(ctx.on_shift_agents, 0)
                 * ring_c / (service_c * p_ceiling)
             )
-            ceiling = int(ceiling)
-            ceiling_new = max(0, ceiling - ctx.ringing_calls - ctx.waiting_calls)
+            # Agents free right now can absorb an answer with no waiting at all,
+            # so the pipeline may exceed the steady-state level by that many.
+            #
+            # Without this term the ceiling also acts as a refill *rate* limit,
+            # which is a real utilisation bug: when a wave of calls ends and 40
+            # agents free at once, the dialer could only replace them `level` at
+            # a time and the floor sat idle while borrowers went uncalled.  That
+            # showed up in the 70%/180s scenario, where calls end in
+            # synchronised waves, as availability swinging between 0 and 40.
+            spare = max(0, ctx.available_agents - ctx.waiting_calls)
+            ceiling = int(level) + spare
+            checks["steady_state_level"] = int(level)
+            checks["burst_allowance"] = spare
+            ceiling_new = max(0, ceiling - ctx.ringing_calls)
             checks["pipeline_ceiling"] = ceiling
             if allowed > ceiling_new:
                 reasons.append(
@@ -281,7 +349,15 @@ class SafetyController:
             p = min(max(ctx.p_answer, 0.01), 0.99)
             # Borrowers already on hold are demand that has materialised: they
             # must be served before anyone we are about to dial.
-            effective_capacity = max(0, capacity - ctx.waiting_calls)
+            #
+            # Note what is deliberately NOT added here: `agents_free_within_
+            # horizon`.  The agents who will free within the horizon are
+            # modelled by `at_risk_agents` / `q_free` inside
+            # `abandon_probability`.  Adding them to `capacity` as well counted
+            # the same agents twice and inflated the safe batch -- in the
+            # 70%/180s run it pushed `max_safe_in_flight` to 69 for a 100-agent
+            # floor.
+            effective_capacity = max(0, ctx.available_agents - ctx.waiting_calls)
             checks["waiting_calls"] = ctx.waiting_calls
             checks["effective_capacity"] = effective_capacity
             safe_total = self._max_safe_in_flight(
@@ -290,11 +366,12 @@ class SafetyController:
             )
             safe_new = max(0, safe_total - ctx.ringing_calls)
             checks["max_safe_in_flight"] = safe_total
-            checks["cap_free_agents"] = capacity
+            checks["cap_free_agents"] = ctx.available_agents
             checks["p_answer"] = round(p, 4)
             if allowed > safe_new:
                 reasons.append(
-                    f"abandonment risk: p_answer={p:.2f}, {capacity} agents free now, "
+                    f"abandonment risk: p_answer={p:.2f}, "
+                    f"{ctx.available_agents} agents free now, "
                     f"{ctx.at_risk_agents} more at risk; more than {safe_total} "
                     f"unanswered calls in flight would exceed "
                     f"P(abandon) <= {cfg.max_abandon_probability:.1%}"

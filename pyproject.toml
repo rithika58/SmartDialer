@@ -23,3 +23,6 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q --tb=short"
+markers = [
+    "slow: re-runs the simulator (seconds); skip with -m 'not slow'",
+]

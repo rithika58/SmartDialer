@@ -134,6 +134,9 @@ def bench_decisions(n: int):
         provider_healthy=True, provider_name="bench",
         at_risk_agents=900, q_free=0.08, avg_ring_seconds=8.0,
         mean_service_seconds=100.0,
+        # A mature floor, so the bench exercises the full check pipeline
+        # instead of stopping at the agent-turnover cold-start gate.
+        service_confidence=1.0, service_observations=5_000,
     )
 
     inputs = PacingInputs(

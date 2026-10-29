@@ -20,6 +20,9 @@ def ctx(**kw):
         campaign_id="C1", now=0.0, available_agents=10, on_shift_agents=50,
         p_answer=0.5, confidence=0.9, queued_borrowers=10000,
         provider_healthy=True, provider_name="ProviderA",
+        # A mature floor by default: these tests are about the pipeline and
+        # abandonment guards, so they must not trip the cold-start gate.
+        service_confidence=1.0, service_observations=500,
     )
     base.update(kw)
     return SafetyContext(**base)
@@ -130,6 +133,27 @@ def test_sustained_abandonment_trips_the_emergency_brake():
         ctx(observed_abandon_rate=0.20, abandon_sample_size=100),
     )
     assert decision.action is SafetyAction.FALLBACK_PROGRESSIVE
+
+
+def test_unknown_agent_turnover_forces_progressive():
+    """Predicting that an agent will be free requires having watched some
+    become free.  Before that, dialing ahead is a guess, so we fall back to the
+    mode whose safety is arithmetic rather than statistical.
+
+    This is the guard that makes the 70%/180s scenario conservative: long calls
+    delay the first observed turnover, so the dialer keeps proving safety by
+    construction for longer instead of by prediction.
+    """
+    controller = SafetyController()
+    decision = controller.evaluate(
+        intent(500),
+        ctx(service_confidence=0.0, service_observations=0, available_agents=7),
+    )
+    assert decision.action is SafetyAction.FALLBACK_PROGRESSIVE
+    assert decision.mode is PacingMode.PROGRESSIVE
+    # Still allowed to dial 1:1 with the agents it can see.
+    assert decision.allowed_calls == 7
+    assert "turnover" in decision.explain()
 
 
 def test_abandonment_guard_bounds_the_pipeline():

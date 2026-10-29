@@ -25,7 +25,7 @@ from ..domain.states import (
     RejectReason,
 )
 from ..providers.base import Scheduler
-from ..stats import BetaBinomialEstimate, ewma
+from ..stats import BetaBinomialEstimate, ServiceEstimate, ewma
 from .allocator import CallAllocator, DialBatchResult, ProviderGateway
 from .pacing import AdaptivePacer, PacingEngine, PacingInputs, PacingMode
 from .safety import SafetyContext, SafetyController, SafetyDecision
@@ -47,7 +47,9 @@ class Metrics:
     safety: Dict[str, int] = field(default_factory=dict)
 
     # Agent-time accounting, in agent-seconds.
-    recent_outcomes: deque = field(default_factory=lambda: deque(maxlen=100))
+    recent_outcomes: deque = field(default_factory=lambda: deque(maxlen=1000))
+    # Last value computed by window_abandon_rate(), for reporting.
+    _window_rate_cache: float = 0.0
     talk_seconds: float = 0.0        # CONNECTED: actually talking to a borrower
     wrap_seconds: float = 0.0        # WRAP_UP
     setup_seconds: float = 0.0       # RESERVED + DIALING: waiting for a borrower
@@ -85,19 +87,41 @@ class Metrics:
     def abandon_rate(self) -> float:
         return self.abandoned / self.calls_answered if self.calls_answered else 0.0
 
-    @property
-    def window_abandon_rate(self) -> float:
-        """Abandon rate over the last <=100 answers.
+    def window_abandon_rate(self, now: float, seconds: float = 60.0) -> float:
+        """Abandon rate over the last `seconds`, not over the last N answers.
 
         A cumulative rate can never recover from a bad first minute; a windowed
         one can, which is what lets the dialer return to aggressive pacing once
-        conditions improve."""
-        if not self.recent_outcomes:
-            return 0.0
-        return sum(self.recent_outcomes) / len(self.recent_outcomes)
+        conditions improve.
 
-    def record_answer(self, abandoned: bool) -> None:
-        self.recent_outcomes.append(1 if abandoned else 0)
+        The window is measured in TIME rather than in answers, which is the
+        whole point.  Windowing on a count means the window's width in seconds
+        depends on how fast answers arrive: about 50s in the 50%/90s scenario
+        but about 200s in the 70%/180s one.  A brake whose reaction time scales
+        with how busy the floor is reacts slowest exactly where it matters
+        most -- and 200s is longer than the entire incident it is meant to
+        catch.
+        """
+        self._trim(now, seconds)
+        if not self.recent_outcomes:
+            self._window_rate_cache = 0.0
+            return 0.0
+        rate = sum(v for _, v in self.recent_outcomes) / len(self.recent_outcomes)
+        self._window_rate_cache = rate
+        return rate
+
+    def window_sample_size(self, now: float, seconds: float = 60.0) -> int:
+        self._trim(now, seconds)
+        return len(self.recent_outcomes)
+
+    def _trim(self, now: float, seconds: float) -> None:
+        cutoff = now - seconds
+        d = self.recent_outcomes
+        while d and d[0][0] < cutoff:
+            d.popleft()
+
+    def record_answer(self, abandoned: bool, now: float = 0.0) -> None:
+        self.recent_outcomes.append((now, 1 if abandoned else 0))
 
     def as_dict(self) -> dict:
         return {
@@ -109,7 +133,7 @@ class Metrics:
             "place_failures": self.place_failures,
             "abandoned": self.abandoned,
             "abandon_rate": round(self.abandon_rate, 4),
-            "window_abandon_rate": round(self.window_abandon_rate, 4),
+            "window_abandon_rate": round(self._window_rate_cache, 4),
             "observed_answer_rate": round(self.answer_rate, 4),
             "duplicate_events": self.duplicate_events,
             "rejected_events": dict(self.rejected_events),
@@ -134,6 +158,7 @@ class DialerWorker:
         campaign_id: str,
         mode: PacingMode = PacingMode.PREDICTIVE,
         wrap_seconds: float = 12.0,
+        abandon_window_seconds: float = 60.0,
         stuck_call_timeout: float = 90.0,
         lease_seconds: float = 30.0,
         patience_seconds: float = 5.0,
@@ -155,18 +180,49 @@ class DialerWorker:
         # cheapest safety margin there is, because it costs nothing when the
         # pacing is right.
         self.patience_seconds = patience_seconds
+        # Width of the sliding window used to judge recent abandonment.
+        # Measured in seconds, not answers -- see Metrics.window_abandon_rate.
+        self.abandon_window_seconds = abandon_window_seconds
         # FIFO of (call_id, answered_at) for borrowers on hold.
         self.holding: List[tuple] = []
 
         self.metrics = Metrics()
         self.pacer = AdaptivePacer(pacing, clock=clock)
         self.answer_estimate = BetaBinomialEstimate()
-        self.avg_talk = 90.0
+        # Replaces the old plain `avg_talk` float.  The prior is the same 90s of
+        # talk plus wrap, but the estimator now also uses agent turnover, so it
+        # stops claiming 102s of service when calls really take 192s.
+        self.service = ServiceEstimate(prior_seconds=90.0 + wrap_seconds)
         self.avg_ring = 8.0
         self._last_tick: Optional[float] = None
         self._placed_this_second: Dict[int, int] = {}
         self.decisions: List[SafetyDecision] = []
         self.pending_callbacks: List[str] = []
+
+    @property
+    def avg_talk(self) -> float:
+        """Point estimate of talk time from completed calls.
+
+        Kept for the per-agent `expected_free_at` hint.  Capacity planning must
+        use `self.service.plan`, which is pessimistic, not this.
+        """
+        return self.service.completed_mean
+
+    def _release_agent(self, agent_id: str, now: float, **kwargs) -> None:
+        """Return an agent to AVAILABLE, recording a service completion.
+
+        Only agents that were genuinely serving (CONNECTED / WRAP_UP) count as
+        turnover.  An agent released because the call failed before it was
+        answered was never tied up for a service duration, and counting it would
+        inflate the observed free rate.
+        """
+        agent = self.store.get_agent(agent_id)
+        if agent is not None and agent.state in (AgentState.CONNECTED, AgentState.WRAP_UP):
+            self.service.observe_free()
+        self.store.set_agent_state(
+            agent_id, AgentState.AVAILABLE, now,
+            worker_id=self.allocator.worker_id, **kwargs,
+        )
 
     # ------------------------------------------------------------------ tick
     def tick(self) -> SafetyDecision:
@@ -203,7 +259,10 @@ class DialerWorker:
         busy_agents = (
             counts.get(AgentState.CONNECTED, 0) + counts.get(AgentState.WRAP_UP, 0)
         )
-        mean_service = max(self.avg_talk + self.wrap_seconds, 1.0)
+        # Accumulate agent-seconds of service before reading the estimate: this
+        # is the denominator of the turnover estimator.
+        self.service.observe_busy(busy_agents, dt)
+        mean_service = max(self.service.plan, 1.0)
         supply_window = horizon + self.patience_seconds
         q_free = max(0.0, min(1.0, supply_window / mean_service))
         expected_frees = busy_agents * q_free
@@ -234,16 +293,22 @@ class DialerWorker:
             ringing_calls=ringing,
             p_answer=self.answer_estimate.p,
             confidence=self.answer_estimate.confidence,
-            avg_talk_seconds=self.avg_talk,
+            avg_talk_seconds=self.service.plan,
             avg_wrap_seconds=self.wrap_seconds,
             avg_ring_seconds=self.avg_ring,
             horizon_seconds=horizon,
             queued_borrowers=self.store.queued_borrowers(self.campaign_id),
+            service_confidence=self.service.confidence,
+            patience_seconds=self.patience_seconds,
+            busy_agents=busy_agents,
+            waiting_calls=len(self.holding),
+            mean_service_seconds=mean_service,
         )
         # ---- closed-loop correction -------------------------------------
         self.pacer.observe(
             now, self.metrics.abandoned, self.metrics.calls_answered,
             self.metrics.idle_seconds, self.metrics.on_shift_seconds,
+            holding=len(self.holding),
         )
         intent = self.pacer.propose(inputs, self.mode)
 
@@ -262,12 +327,16 @@ class DialerWorker:
             queued_borrowers=inputs.queued_borrowers,
             provider_healthy=self.gateway.is_healthy(),
             provider_name=self.gateway.healthy_provider_name() or "none",
-            observed_abandon_rate=self.metrics.window_abandon_rate,
-            abandon_sample_size=len(self.metrics.recent_outcomes),
+            observed_abandon_rate=self.metrics.window_abandon_rate(
+                now, self.abandon_window_seconds),
+            abandon_sample_size=self.metrics.window_sample_size(
+                now, self.abandon_window_seconds),
             waiting_calls=len(self.holding),
             on_shift_agents=on_shift,
             avg_ring_seconds=self.avg_ring,
             mean_service_seconds=mean_service,
+            service_confidence=self.service.confidence,
+            service_observations=self.service.n_freed,
             calls_placed_last_second=placed,
             at_risk_agents=at_risk,
             q_free=q_free,
@@ -340,11 +409,11 @@ class DialerWorker:
                 lease_seconds=self.lease_seconds,
                 call_id=call.call_id,
             )
-            self.metrics.record_answer(False)
+            self.metrics.record_answer(False, now)
             return
 
         if self._bind_free_agent(call, now):
-            self.metrics.record_answer(False)
+            self.metrics.record_answer(False, now)
             return
 
         # No agent right now -> hold, in FIFO order.
@@ -388,7 +457,7 @@ class DialerWorker:
             if call is None or call.is_terminal():
                 continue
             if self._bind_free_agent(call, now):
-                self.metrics.record_answer(False)
+                self.metrics.record_answer(False, now)
                 continue
             waited = now - queued_at
             if waited >= self.patience_seconds:
@@ -405,7 +474,7 @@ class DialerWorker:
         queued, so the borrower is always spoken to by something.
         """
         self.metrics.abandoned += 1
-        self.metrics.record_answer(True)
+        self.metrics.record_answer(True, now)
         call.abandoned = True
         self.store.apply_event(
             ProviderEvent(
@@ -443,15 +512,13 @@ class DialerWorker:
         if call.ended_at and call.connected_at:
             talk = call.ended_at - call.connected_at
             if 1.0 <= talk <= 3600.0:
-                self.avg_talk = ewma(self.avg_talk, talk, 0.2)
-        elif call.connected_at:
-            # Calls that are still running are, on average, the LONG ones --
-            # ignoring them biases the mean downwards and makes the dialer
-            # over-dial.  Counting them at their current age removes most of
-            # that survivorship bias.
-            partial = now - call.connected_at
-            if 1.0 <= partial <= 3600.0:
-                self.avg_talk = ewma(self.avg_talk, partial * 1.6, 0.05)
+                self.service.observe_completed(talk + self.wrap_seconds)
+        # NOTE: this used to correct survivorship bias by feeding still-running
+        # calls in as `partial * 1.6` at a tiny EWMA weight.  That is arbitrary
+        # and far too slow -- it left the estimate at 102s for the first 180s of
+        # the 70%/180s scenario, when the truth was 192s.  The turnover
+        # estimator in `ServiceEstimate` does this job properly, by using the
+        # rate at which agents are actually observed coming back.
         if call.answered_at and call.initiated_at:
             ring = call.answered_at - call.initiated_at
             self.avg_ring = ewma(self.avg_ring, max(ring, 1.0), 0.2)
@@ -471,17 +538,11 @@ class DialerWorker:
                 lambda aid=call.agent_id: self._end_wrap(aid),
             )
         else:
-            self.store.set_agent_state(
-                call.agent_id, AgentState.AVAILABLE, now,
-                worker_id=self.allocator.worker_id,
-            )
+            self._release_agent(call.agent_id, now)
 
     def _end_wrap(self, agent_id: str) -> None:
         now = self.clock.now()
-        self.store.set_agent_state(
-            agent_id, AgentState.AVAILABLE, now,
-            expected_states=[AgentState.WRAP_UP],
-        )
+        self._release_agent(agent_id, now, expected_states=[AgentState.WRAP_UP])
         # An agent just freed up -- hand them straight to whoever is holding
         # rather than waiting for the next tick.
         self._service_holding(now)
@@ -528,9 +589,7 @@ class DialerWorker:
             if updated is not None:
                 updated.outcome = "PROVIDER_SILENT"
                 if call.agent_id:
-                    self.store.set_agent_state(
-                        call.agent_id, AgentState.AVAILABLE, now
-                    )
+                    self._release_agent(call.agent_id, now)
             reaped += 1
         return reaped
 
