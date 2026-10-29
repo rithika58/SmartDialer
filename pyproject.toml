@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartdialer"
+version = "1.0.0"
+description = "SmartDialer prototype: progressive and predictive dialing behind an unbypassable safety controller"
+readme = "README.md"
+requires-python = ">=3.10"
+# Runtime is deliberately stdlib-only. pytest is the only development dependency.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "hypothesis"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# With this, `pytest` works from a plain terminal with no PYTHONPATH and no
+# editable install -- including inside VS Code.
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q --tb=short"

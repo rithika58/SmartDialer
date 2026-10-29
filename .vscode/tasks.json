@@ -1,0 +1,42 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Tests",
+      "type": "shell",
+      "command": "python3 -m pytest tests",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Simulation matrix",
+      "type": "shell",
+      "command": "python3 scripts/run_sim.py --agents 100 --duration 1800",
+      "problemMatcher": []
+    },
+    {
+      "label": "Failure demo",
+      "type": "shell",
+      "command": "python3 scripts/demo_failures.py",
+      "problemMatcher": []
+    },
+    {
+      "label": "Load test",
+      "type": "shell",
+      "command": "python3 scripts/load_test.py --agents 2000 --workers 16 --seconds 5",
+      "problemMatcher": []
+    },
+    {
+      "label": "Generate dashboard",
+      "type": "shell",
+      "command": "python3 scripts/gen_dashboard.py --agents 60 --minutes 30",
+      "problemMatcher": []
+    },
+    {
+      "label": "Install (editable, optional)",
+      "type": "shell",
+      "command": "python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'",
+      "problemMatcher": []
+    }
+  ]
+}
